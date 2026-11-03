@@ -1,87 +1,131 @@
 package partitioning
 
-import "sort"
+import (
+	"sort"
+	"time"
+)
+
+type Properties struct {
+	Name      string
+	CreatedAt time.Time
+}
+
+type Task struct {
+	ID         uint64
+	Properties Properties
+}
+
+type Worker struct {
+	ID         uint64
+	Properties Properties
+}
 
 // Edge is a weighted worker–task edge. Score is expected in [0, 1].
 type Edge struct {
-	Task   uint64
-	Worker uint64
+	Task   *Task
+	Worker *Worker
 	Score  float32
 }
 
 // ---------------------------------------------------------------------------
 // Graph (CSR over tasks 0..nT-1 and workers nT..nT+nW-1)
 
-type graph struct {
-	nT, nW    int
-	taskIDs   []uint64
-	workerIDs []uint64
-	edges     []Edge // pruned, deduplicated, sorted by (Task, Worker)
-	eTask     []int32
-	eWorker   []int32
-	off       []int32 // len nT+nW+1
-	adj       []int32 // neighbor vertex index
-	w         []float32
-	eidx      []int32 // edge index for (vertex, neighbor)
+// Graph is an immutable, deduplicated worker–task graph ready for Partition.
+// Build it with NewGraph; one Graph may be partitioned any number of times,
+// including concurrently.
+type Graph struct {
+	nT, nW     int
+	tasks      []*Task
+	workers    []*Worker
+	edges      []*Edge // deduplicated, sorted by (Task.ID, Worker.ID)
+	duplicates int     // edges merged away by NewGraph
+	eTask      []int32
+	eWorker    []int32
+	off        []int32 // len nT+nW+1
+	adj        []int32 // neighbor vertex index
+	w          []float32
+	eidx       []int32 // edge index for (vertex, neighbor)
 }
 
-func (g *graph) nbrs(v int32) (adj []int32, w []float32, eidx []int32) {
+// NewGraph builds a graph from edges. Vertices are identified by pointer:
+// every edge of a task must carry the same *Task, and likewise for workers.
+// Edges with the same (Task, Worker) pointers are merged, keeping the highest
+// score. The edges are referenced, not copied. It panics on an edge with a nil
+// Task or Worker.
+func NewGraph(edges []*Edge) *Graph { return buildGraph(edges) }
+
+// Len returns the number of distinct edges.
+func (g *Graph) Len() int { return len(g.edges) }
+
+// Duplicates returns how many input edges NewGraph merged into another edge.
+func (g *Graph) Duplicates() int { return g.duplicates }
+
+func (g *Graph) nbrs(v int32) (adj []int32, w []float32, eidx []int32) {
 	a, b := g.off[v], g.off[v+1]
 	return g.adj[a:b], g.w[a:b], g.eidx[a:b]
 }
 
-func (g *graph) deg(v int32) int { return int(g.off[v+1] - g.off[v]) }
+func (g *Graph) deg(v int32) int { return int(g.off[v+1] - g.off[v]) }
 
-func buildGraph(in []Edge, theta float32) (*graph, int) {
-	es := make([]Edge, len(in))
+func buildGraph(in []*Edge) *Graph {
+	es := make([]*Edge, len(in))
 	copy(es, in)
-	sort.Slice(es, func(i, j int) bool {
-		if es[i].Task != es[j].Task {
-			return es[i].Task < es[j].Task
+	for _, e := range es {
+		if e == nil || e.Task == nil || e.Worker == nil {
+			panic("partition: edge with nil Task or Worker")
 		}
-		if es[i].Worker != es[j].Worker {
-			return es[i].Worker < es[j].Worker
+	}
+	// Vertex identity is the pointer: edges sharing a Task (or Worker) must
+	// share the same *Task (*Worker). Ordering is by ID, never by address,
+	// so the result depends only on the edge set and not on the allocator.
+	sort.SliceStable(es, func(i, j int) bool {
+		a, b := es[i], es[j]
+		if a.Task.ID != b.Task.ID {
+			return a.Task.ID < b.Task.ID
 		}
-		return es[i].Score > es[j].Score
+		if a.Worker.ID != b.Worker.ID {
+			return a.Worker.ID < b.Worker.ID
+		}
+		return a.Score > b.Score
 	})
-	// dedupe (keep max score, which sorts first) and prune
+	// dedupe: duplicates are edges with the same Task and Worker pointers;
+	// the max score sorts first within an equal-ID run, so it is the one kept
 	out := es[:0]
-	pruned := 0
-	for i, e := range es {
-		if i > 0 && e.Task == es[i-1].Task && e.Worker == es[i-1].Worker {
-			pruned++
+	dups := 0
+	seen := make(map[[2]any]struct{}, len(es))
+	for _, e := range es {
+		key := [2]any{e.Task, e.Worker}
+		if _, dup := seen[key]; dup {
+			dups++
 			continue
 		}
-		if e.Score < theta {
-			pruned++
-			continue
-		}
+		seen[key] = struct{}{}
 		out = append(out, e)
 	}
 	es = out
 
-	g := &graph{edges: es}
-	tasks := make(map[uint64]int32, len(es))
-	workers := make(map[uint64]int32, len(es))
+	g := &Graph{edges: es, duplicates: dups}
+	tasks := make(map[*Task]int32, len(es))
+	workers := make(map[*Worker]int32, len(es))
 	for _, e := range es {
 		if _, ok := tasks[e.Task]; !ok {
 			tasks[e.Task] = 0
-			g.taskIDs = append(g.taskIDs, e.Task)
+			g.tasks = append(g.tasks, e.Task)
 		}
 		if _, ok := workers[e.Worker]; !ok {
 			workers[e.Worker] = 0
-			g.workerIDs = append(g.workerIDs, e.Worker)
+			g.workers = append(g.workers, e.Worker)
 		}
 	}
-	sort.Slice(g.workerIDs, func(i, j int) bool { return g.workerIDs[i] < g.workerIDs[j] })
-	// taskIDs are already ascending because es is sorted by Task.
-	for i, id := range g.taskIDs {
-		tasks[id] = int32(i)
+	sort.SliceStable(g.workers, func(i, j int) bool { return g.workers[i].ID < g.workers[j].ID })
+	// tasks are already ascending by ID because es is sorted by Task.ID.
+	for i, t := range g.tasks {
+		tasks[t] = int32(i)
 	}
-	for i, id := range g.workerIDs {
-		workers[id] = int32(i)
+	for i, w := range g.workers {
+		workers[w] = int32(i)
 	}
-	g.nT, g.nW = len(g.taskIDs), len(g.workerIDs)
+	g.nT, g.nW = len(g.tasks), len(g.workers)
 	n := g.nT + g.nW
 
 	g.eTask = make([]int32, len(es))
@@ -110,7 +154,7 @@ func buildGraph(in []Edge, theta float32) (*graph, int) {
 		fill[w]++
 	}
 	// Adjacency of a task is sorted by worker index and adjacency of a
-	// worker by task index, because es is sorted by (Task, Worker) and
-	// indices follow id order. This keeps BFS deterministic.
-	return g, pruned
+	// worker by task index, because es is sorted by (Task.ID, Worker.ID) and
+	// indices follow ID order. This keeps BFS deterministic.
+	return g
 }

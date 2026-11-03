@@ -50,22 +50,21 @@ func (p *partitioner) assemble(res *Result) {
 	}
 
 	// distinct counts and drop empty parts
-	seen := make(map[uint64]struct{}, 64)
+	seenTask := make(map[*Task]struct{}, 64)
+	seenWorker := make(map[*Worker]struct{}, 64)
 	for r := range parts {
 		pt := &parts[r]
 		if len(pt.Edges) == 0 {
 			continue
 		}
-		clear(seen)
+		clear(seenTask)
+		clear(seenWorker)
 		for _, e := range pt.Edges {
-			seen[e.Task] = struct{}{}
+			seenTask[e.Task] = struct{}{}
+			seenWorker[e.Worker] = struct{}{}
 		}
-		pt.Tasks = len(seen)
-		clear(seen)
-		for _, e := range pt.Edges {
-			seen[e.Worker] = struct{}{}
-		}
-		pt.Workers = len(seen)
+		pt.Tasks = len(seenTask)
+		pt.Workers = len(seenWorker)
 		res.Parts = append(res.Parts, *pt)
 	}
 }
