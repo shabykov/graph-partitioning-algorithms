@@ -26,9 +26,6 @@ type Config struct {
 	Mode Mode
 	// MaxEdges is the edge limit of one sub-graph. Must be > 0.
 	MaxEdges int
-	// Theta drops every edge with Score < Theta before partitioning.
-	// 0 disables pruning.
-	Theta float32
 	// Epsilon is the balance tolerance of a bisection: each half may hold
 	// up to (0.5+Epsilon) of the edges. Default 0.1.
 	Epsilon float64

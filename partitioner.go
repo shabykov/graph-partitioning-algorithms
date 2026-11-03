@@ -10,7 +10,7 @@
 //     copied into every sub-graph that holds at least one of its tasks.
 //     No edge is lost.
 //
-// Both modes share one pipeline: prune thin edges → split into connected
+// Both modes share one pipeline: split into connected
 // components → recursively bisect components that exceed MaxEdges
 // (BFS ordering → cut at half the edges → Fiduccia–Mattheyses refinement).
 // The result is fully deterministic for a given input set of edges,
@@ -19,7 +19,7 @@ package partitioning
 
 // Part is one sub-graph ready for matching.
 type Part struct {
-	Edges   []Edge
+	Edges   []*Edge
 	Tasks   int // distinct tasks in Edges
 	Workers int // distinct workers in Edges
 }
@@ -28,29 +28,33 @@ type Part struct {
 type Result struct {
 	// Parts are the sub-graphs. Every part has at least one edge.
 	Parts []Part
+
 	// Cut holds the dropped crossing edges (EdgeCut only; empty otherwise).
-	Cut []Edge
+	Cut []*Edge
+
 	// CutCost is the sum of scores of Cut (EdgeCut) or the sum of scores of
 	// worker edges that sit outside the worker's home part (UniqueTasks).
 	// A worker's home part is the one with the largest sum of its scores.
 	CutCost float64
-	// Pruned is the number of edges removed by Theta (duplicates included).
-	Pruned int
+
 	// Oversized counts parts that exceed MaxEdges because they could not be
 	// split further (a single task with more than MaxEdges edges, for example).
 	Oversized int
 }
 
-// Partition splits edges into sub-graphs of at most cfg.MaxEdges edges.
-// The input does not need to be connected; components are detected.
-// Duplicate (Task, Worker) pairs are merged, keeping the highest score.
-func Partition(cfg Config, edges []Edge) Result {
+// Partition splits g into sub-graphs of at most cfg.MaxEdges edges.
+// The graph does not need to be connected; components are detected.
+// g is not modified. Part.Edges and Result.Cut point at the edges given to
+// NewGraph; nothing is copied. A nil g is treated as empty.
+func Partition(cfg Config, g *Graph) Result {
 	cfg = cfg.withDefaults()
 	if cfg.MaxEdges <= 0 {
 		panic("partition: MaxEdges must be > 0")
 	}
-	g, pruned := buildGraph(edges, cfg.Theta)
-	res := Result{Pruned: pruned}
+	if g == nil {
+		return Result{}
+	}
+	var res Result
 	if len(g.edges) == 0 {
 		return res
 	}
@@ -75,7 +79,7 @@ func Partition(cfg Config, edges []Edge) Result {
 // Partitioner state
 
 type partitioner struct {
-	g   *graph
+	g   *Graph
 	cfg Config
 
 	setID   []int32 // current working set of a vertex (-1 = none)
@@ -101,7 +105,7 @@ type partitioner struct {
 	dirty     []int32
 }
 
-func newPartitioner(g *graph, cfg Config) *partitioner {
+func newPartitioner(g *Graph, cfg Config) *partitioner {
 	n := g.nT + g.nW
 	p := &partitioner{g: g, cfg: cfg}
 	p.setID = make([]int32, n)
